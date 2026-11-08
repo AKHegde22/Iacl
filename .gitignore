@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+save_models/
+*.pt
+.DS_Store

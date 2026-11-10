@@ -319,9 +319,9 @@ class VectorizedCartPolePhysics:
         theta_dot = aug_state[..., 4]
         act = action[..., 0]
 
-        upright_bonus = cos_t - 0.5 * (sin_t ** 2)
-        pos_penalty = 0.25 * (x ** 2)
-        vel_penalty = 0.05 * (x_dot ** 2) + 0.05 * (theta_dot ** 2)
+        upright_bonus = cos_t - 0.6 * (sin_t ** 2)
+        pos_penalty = 0.55 * (x ** 2)
+        vel_penalty = 0.06 * (x_dot ** 2) + 0.05 * (theta_dot ** 2)
         act_penalty = 0.02 * (act ** 2)
         return upright_bonus - pos_penalty - vel_penalty - act_penalty
 
@@ -335,10 +335,14 @@ class VectorizedCartPolePhysics:
         """
         Sample initial physical states q_0 and combine with the continuous sensory field
         reading xi_0 to form s_0 = [q_0, xi_0] in R^8.
+        When `near_upright=True` (used in live CEM-MPC), starts with an initial cart offset
+        |x_0| in [0.75, 1.05] m and outward velocity so active motor centering with the
+        correct motor-torque polarity is required to stabilize at x = 0, theta = 0.
         """
         if near_upright:
-            x = torch.empty((batch_size, 1), device=device).uniform_(-0.25, 0.25)
-            x_dot = torch.empty((batch_size, 1), device=device).uniform_(-0.35, 0.35)
+            sign_x = torch.randint(0, 2, (batch_size, 1), device=device, dtype=torch.float32) * 2.0 - 1.0
+            x = sign_x * torch.empty((batch_size, 1), device=device).uniform_(0.75, 1.05)
+            x_dot = sign_x * torch.empty((batch_size, 1), device=device).uniform_(0.15, 0.45)
             theta = torch.empty((batch_size, 1), device=device).uniform_(-0.20, 0.20)
             theta_dot = torch.empty((batch_size, 1), device=device).uniform_(-0.35, 0.35)
         else:
@@ -361,19 +365,35 @@ class VectorizedCartPolePhysics:
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Generate a batch of trajectories of length `seq_len` under `params`.
-        Rolls out short multi-step sub-trajectories (length 5) with exploratory actions,
-        resetting to diverse initial states every 5 steps to cover the state-action manifold.
-
-        Returns:
-            states: (seq_len, batch_size, 8)
-            actions: (seq_len, batch_size, 1)
-            deltas: (seq_len, batch_size, 5)
+        Vectorizes across `num_seg` sub-trajectories of length `sub_traj_len=5`
+        simultaneously to reduce sequential RK4 kernel launches by 5x on GPU.
         """
+        sub_traj_len = 5
+        if init_aug_state is None and seq_len % sub_traj_len == 0:
+            num_seg = seq_len // sub_traj_len
+            total_b = num_seg * batch_size
+            exp_params = {
+                k: v.unsqueeze(0).expand(num_seg, batch_size, -1).reshape(total_b, -1)
+                for k, v in params.items()
+            }
+            aug_state = self.sample_initial_augmented_state(total_b, exp_params, device)
+            s_seg, a_seg, ds_seg = [], [], []
+            for _ in range(sub_traj_len):
+                action = torch.empty((total_b, 1), device=device).uniform_(-1.0, 1.0)
+                next_aug_state, delta_q = self.step_augmented(aug_state, action, exp_params)
+                s_seg.append(aug_state.reshape(num_seg, batch_size, self.STATE_DIM))
+                a_seg.append(action.reshape(num_seg, batch_size, self.ACTION_DIM))
+                ds_seg.append(delta_q.reshape(num_seg, batch_size, self.PHYS_DIM))
+                aug_state = next_aug_state
+            states = torch.stack(s_seg, dim=1).reshape(seq_len, batch_size, self.STATE_DIM)
+            actions = torch.stack(a_seg, dim=1).reshape(seq_len, batch_size, self.ACTION_DIM)
+            deltas = torch.stack(ds_seg, dim=1).reshape(seq_len, batch_size, self.PHYS_DIM)
+            return states, actions, deltas
+
         states_list = []
         actions_list = []
         deltas_list = []
 
-        sub_traj_len = 5
         aug_state = init_aug_state
         for t in range(seq_len):
             if aug_state is None or (t > 0 and t % sub_traj_len == 0 and init_aug_state is None):

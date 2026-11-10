@@ -196,14 +196,15 @@ class LinearTransformerFFlayer(nn.Module):
         return out
 
 
-# Standard Causal Transformer layer with KV-cache state
+# Standard Causal Transformer layer with bounded sliding-window KV-cache state
 class CausalAttentionFFlayer(nn.Module):
-    def __init__(self, num_head, dim_head, in_dim, dropout, stateful=True):
+    def __init__(self, num_head, dim_head, in_dim, dropout, stateful=True, max_cache_len=30):
         super(CausalAttentionFFlayer, self).__init__()
         self.num_head = num_head
         self.dim_head = dim_head
         self.in_dim = in_dim
         self.stateful = stateful
+        self.max_cache_len = max_cache_len
         self.scale = 1.0 / math.sqrt(dim_head)
 
         self.qkv_proj = nn.Linear(in_dim, num_head * 3 * dim_head, bias=False)
@@ -258,6 +259,9 @@ class CausalAttentionFFlayer(nn.Module):
             attn = F.softmax(scores, dim=-1)
             attn = self.drop(attn)
             out = torch.matmul(attn, v_all)
+            if k_all.size(2) > self.max_cache_len:
+                k_all = k_all[:, :, -self.max_cache_len:].contiguous()
+                v_all = v_all[:, :, -self.max_cache_len:].contiguous()
             new_state = (k_all, v_all)
 
         out = out.transpose(1, 2).reshape(bsz, slen, self.num_head * self.dim_head).transpose(0, 1)

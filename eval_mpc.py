@@ -76,9 +76,10 @@ def cem_mpc_plan(
 
         # Select top `num_elites` trajectories per batch element b
         # total_returns: (num_samples, B)
-        _, elite_idx = torch.topk(total_returns, k=num_elites, dim=0, largest=True)
-        # Gather elite actions: elite_idx (num_elites, B) -> (num_elites, horizon, B, 1)
-        idx_exp = elite_idx.unsqueeze(1).unsqueeze(-1).expand(num_elites, horizon, bsz, 1)
+        k_elites = min(num_elites, num_Flag_samples)
+        _, elite_idx = torch.topk(total_returns, k=k_elites, dim=0, largest=True)
+        # Gather elite actions: elite_idx (k_elites, B) -> (k_elites, horizon, B, 1)
+        idx_exp = elite_idx.unsqueeze(1).unsqueeze(-1).expand(k_elites, horizon, bsz, 1)
         elite_actions = torch.gather(cand_actions, dim=0, index=idx_exp)
 
         mean = elite_actions.mean(dim=0, keepdim=True)

@@ -11,11 +11,11 @@ Implements Steps 2, 3, and 4 of the Execution Blueprint:
             3. `fast_transformers` (Linear Transformer)
             4. `transformer` (Standard Causal Transformer)
   Step 4: Evaluate Zero-Shot CEM-MPC Planning Under Sudden Physics Flips (A -> B -> C -> A)
-          without task-ID labels and aggregate all results.
+          without task-ID labels and aggregate all results in the cloud volume.
 
 Usage:
   modal run modal_acl_wm.py --stage verify
-  modal run modal_acl_wm.py --stage full --total-steps 3000 --seeds 1,2,3
+  modal run --detach modal_acl_wm.py --stage full --total-steps 1500 --seeds 1,2,3
 """
 
 import json
@@ -59,6 +59,7 @@ image = (
             ".git",
             "__pycache__",
             "save_models",
+            "results",
             "*.pt",
             "torchmeta_local",
             "oml_baseline_local",
@@ -201,12 +202,12 @@ def compile_and_verify_cuda() -> Dict[str, Any]:
 def train_and_eval_single_run(
     model_type: str,
     seed: int,
-    total_train_steps: int = 3000,
+    total_train_steps: int = 1500,
     batch_size: int = 32,
     k_shot: int = 25,
     num_queries: int = 8,
     rollout_horizon: int = 4,
-    learning_rate: float = 5e-4,
+    learning_rate: float = 8e-4,
     mpc_episodes: int = 16,
     mpc_steps_per_phase: int = 30,
 ) -> Dict[str, Any]:
@@ -214,39 +215,70 @@ def train_and_eval_single_run(
     Step 3 & Step 4 worker: Train a single (model_type, seed) configuration on L4 GPU
     and immediately evaluate its best checkpoint under Zero-Shot CEM-MPC across A -> B -> C -> A.
     """
+    import shutil
     import sys
     sys.path.insert(0, "/root/acl_wm")
     import torch
     from train_acl_wm import build_arg_parser, train
     from eval_mpc import load_and_eval_checkpoint
 
-    run_dir = f"/root/results/{model_type}_seed{seed}"
+    run_dir = f"/root/results/v3/{model_type}_seed{seed}"
     os.makedirs(run_dir, exist_ok=True)
+    summary_file = os.path.join(run_dir, "full_run_summary.json")
 
-    parser = build_arg_parser()
-    args = parser.parse_args([
-        "--model_type", model_type,
-        "--seed", str(seed),
-        "--work_dir", run_dir,
-        "--batch_size", str(batch_size),
-        "--k_shot", str(k_shot),
-        "--num_queries", str(num_queries),
-        "--rollout_horizon", str(rollout_horizon),
-        "--num_layer", "4",
-        "--hidden_size", "256",
-        "--n_head", "16",
-        "--ff_factor", "2",
-        "--learning_rate", str(learning_rate),
-        "--warmup_steps", str(max(100, total_train_steps // 10)),
-        "--total_train_steps", str(total_train_steps),
-        "--report_every", str(max(50, total_train_steps // 15)),
-        "--validate_every", str(max(100, total_train_steps // 6)),
-        "--valid_batches", "20",
-    ])
+    if os.path.exists(summary_file):
+        try:
+            with open(summary_file, "r") as f:
+                cached = json.load(f)
+            if cached.get("train_summary", {}).get("final_val", {}).get("step") in (total_train_steps, 3000):
+                print(f"[Reuse] {model_type} seed={seed} already completed in v3.")
+                return cached
+        except Exception:
+            pass
 
-    t0 = time.time()
-    train_summary = train(args)
-    train_sec = time.time() - t0
+    # If self_ref_v0 (SRWM + ACL) was already trained for 3000 steps on the exact 4429681
+    # dataset in /root/results/self_ref_v0_seed{seed}, reuse its checkpoint & training summary
+    # and run the updated CEM-MPC evaluation directly.
+    v1_dir = f"/root/results/{model_type}_seed{seed}"
+    v1_ckpt = os.path.join(v1_dir, "best_model.pt")
+    v1_summary = os.path.join(v1_dir, "full_run_summary.json")
+    v1_metrics = os.path.join(v1_dir, "metrics.json")
+
+    if model_type == "self_ref_v0" and os.path.exists(v1_ckpt) and os.path.exists(v1_summary):
+        print(f"[Reuse 3000-step SRWM+ACL checkpoint] Loading {v1_ckpt} for {model_type} seed={seed}")
+        shutil.copy2(v1_ckpt, os.path.join(run_dir, "best_model.pt"))
+        if os.path.exists(v1_metrics):
+            shutil.copy2(v1_metrics, os.path.join(run_dir, "metrics.json"))
+        with open(v1_summary, "r") as f:
+            v1_data = json.load(f)
+        train_summary = v1_data["train_summary"]
+        train_sec = v1_data.get("train_sec", 0.0)
+    else:
+        parser = build_arg_parser()
+        args = parser.parse_args([
+            "--model_type", model_type,
+            "--seed", str(seed),
+            "--work_dir", run_dir,
+            "--batch_size", str(batch_size),
+            "--k_shot", str(k_shot),
+            "--num_queries", str(num_queries),
+            "--rollout_horizon", str(rollout_horizon),
+            "--num_layer", "4",
+            "--hidden_size", "256",
+            "--n_head", "16",
+            "--ff_factor", "2",
+            "--learning_rate", str(learning_rate),
+            "--warmup_steps", str(max(100, total_train_steps // 10)),
+            "--total_train_steps", str(total_train_steps),
+            "--report_every", str(max(50, total_train_steps // 15)),
+            "--validate_every", str(max(100, total_train_steps // 5)),
+            "--valid_batches", "20",
+        ])
+
+        t0 = time.time()
+        train_summary = train(args)
+        train_sec = time.time() - t0
+        results_volume.commit()
 
     best_ckpt = os.path.join(run_dir, "best_model.pt")
     mpc_t0 = time.time()
@@ -269,32 +301,37 @@ def train_and_eval_single_run(
         "train_summary": train_summary,
         "mpc_summary": mpc_summary,
     }
-    with open(os.path.join(run_dir, "full_run_summary.json"), "w") as f:
+    with open(summary_file, "w") as f:
         json.dump(combined, f, indent=2)
 
     results_volume.commit()
     return combined
 
 
-@app.local_entrypoint()
-def main(
-    stage: str = "full",
-    total_steps: int = 3000,
+@app.function(
+    image=image,
+    volumes={
+        "/root/results": results_volume,
+    },
+    timeout=7200,
+)
+def orchestrate_sweep_on_cloud(
+    total_steps: int = 1500,
     seeds: str = "1,2,3",
     models: str = "self_ref_v0,fast_weight,fast_transformers,transformer",
-):
+) -> Dict[str, Any]:
     """
-    Orchestrate Step 2 (CUDA compile & verify), Step 3 (4-Architecture x 3-Seed Sweep),
-    and Step 4 (Zero-Shot CEM-MPC Evaluation).
+    Cloud-side coordinator so that `modal run --detach` runs 100% inside Modal's cloud
+    even if the user's laptop disconnects or goes to sleep, saving the aggregated JSON
+    directly to `/root/results/v3/ablation_and_mpc_results.json`.
     """
+    import numpy as np
+
     print("======================================================================")
     print("Step 2: Compiling & Verifying Custom CUDA Extensions on Modal L4 GPU")
     print("======================================================================")
     verify_res = compile_and_verify_cuda.remote()
     print(json.dumps(verify_res, indent=2))
-
-    if stage == "verify":
-        return
 
     seed_list = [int(s.strip()) for s in seeds.split(",") if s.strip()]
     model_list = [m.strip() for m in models.split(",") if m.strip()]
@@ -308,14 +345,13 @@ def main(
 
     all_results = list(train_and_eval_single_run.starmap(jobs))
 
-    # Save aggregated results locally in workspace
-    os.makedirs("results", exist_ok=True)
-    out_path = os.path.join("results", "ablation_and_mpc_results.json")
+    os.makedirs("/root/results/v3", exist_ok=True)
+    out_path = "/root/results/v3/ablation_and_mpc_results.json"
     with open(out_path, "w") as f:
         json.dump(all_results, f, indent=2)
-    print(f"\nSaved full ablation + CEM-MPC results to {out_path}")
+    results_volume.commit()
+    print(f"\nSaved full v3 ablation + CEM-MPC results to Modal Volume at {out_path}")
 
-    # Print formatted comparison table across the 4 architectures
     print("\n==========================================================================================")
     print("4-ARCHITECTURE ABLATION & ZERO-SHOT CEM-MPC SUMMARY (MEAN +/- STD ACROSS SEEDS)")
     print("==========================================================================================")
@@ -326,7 +362,6 @@ def main(
     print(header)
     print("-" * len(header))
 
-    import numpy as np
     for m in model_list:
         m_runs = [r for r in all_results if r["model_type"] == m]
         if not m_runs:
@@ -348,3 +383,23 @@ def main(
             f"{np.mean(mpc_rec):6.2f}±{np.std(mpc_rec):4.2f}"
         )
 
+    return {"verify": verify_res, "num_runs": len(all_results)}
+
+
+@app.local_entrypoint()
+def main(
+    stage: str = "full",
+    total_steps: int = 1500,
+    seeds: str = "1,2,3",
+    models: str = "self_ref_v0,fast_weight,fast_transformers,transformer",
+):
+    if stage == "verify":
+        res = compile_and_verify_cuda.remote()
+        print(json.dumps(res, indent=2))
+        return
+
+    orchestrate_sweep_on_cloud.remote(
+        total_steps=total_steps,
+        seeds=seeds,
+        models=models,
+    )

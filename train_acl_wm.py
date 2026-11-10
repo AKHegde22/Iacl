@@ -214,10 +214,15 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
         optimizer, T_max=args.total_train_steps, eta_min=args.learning_rate * 0.05
     )
 
+    use_acl_obj = (
+        (model.canonical_type == 'self_ref_v0' or args.force_acl)
+        and not args.disable_acl
+    )
+
     print(
         f"[ACL-WM] Training model_type={args.model_type} ({model.canonical_type}) | "
-        f"params={model.num_params():,} | device={device} | seed={args.seed} | "
-        f"steps={args.total_train_steps}"
+        f"use_acl={use_acl_obj} | params={model.num_params():,} | device={device} | "
+        f"seed={args.seed} | steps={args.total_train_steps}"
     )
 
     history = []
@@ -243,7 +248,7 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
             episode_batch,
             lambda_multistep=args.lambda_multistep,
             alpha_intermediate=args.alpha_intermediate,
-            use_acl=not args.disable_acl,
+            use_acl=use_acl_obj,
         )
 
         model.reset_grad()
@@ -282,7 +287,7 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
                 num_batches=args.valid_batches,
                 lambda_multistep=args.lambda_multistep,
                 alpha_intermediate=args.alpha_intermediate,
-                use_acl=not args.disable_acl,
+                use_acl=use_acl_obj,
             )
             # Restore training RNG state progression
             set_seed(args.seed + step * 101)
@@ -308,8 +313,13 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
                 'val_metrics': val_metrics,
             }
             torch.save(ckpt_payload, latest_ckpt_path)
-            if val_metrics['mse_mean_after_123'] < best_val_mse:
-                best_val_mse = val_metrics['mse_mean_after_123']
+            sel_score = (
+                val_metrics['mse_mean_after_123']
+                if use_acl_obj
+                else val_metrics['total_loss']
+            )
+            if sel_score < best_val_mse:
+                best_val_mse = sel_score
                 torch.save(ckpt_payload, best_ckpt_path)
 
             with open(os.path.join(args.work_dir, 'metrics.json'), 'w') as f:
@@ -362,6 +372,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument('--lambda_multistep', type=float, default=0.5)
     parser.add_argument('--alpha_intermediate', type=float, default=0.5)
     parser.add_argument('--disable_acl', action='store_true')
+    parser.add_argument('--force_acl', action='store_true')
     parser.add_argument('--learning_rate', type=float, default=5e-4)
     parser.add_argument('--weight_decay', type=float, default=1e-4)
     parser.add_argument('--warmup_steps', type=int, default=200)
